@@ -98,6 +98,103 @@ class CallAuditService(BaseModuleService):
             audit["verified"] = valid_sub
         return audits
 
+    # ========================================================
+    # 归并批次关联：把持久化处理记录与逐行审计打通
+    # ========================================================
+
+    def list_merge_audits(self, batch_id: str) -> list[dict[str, Any]]:
+        """按原归并批次号调出关联的全部逐行审计记录。
+
+        值班人员据此辨认哪些记录已确认（confirmed=True）、哪些仍待补处理。
+        """
+        from app.services.data_manager import list_audit
+        return [
+            rec for rec in list_audit(caller="data_merge")
+            if rec.get("batch_id") == batch_id
+        ]
+
+    def batch_audit_summary(self, batch_id: str) -> dict[str, Any]:
+        """汇总批次的审计计数，供与归并明细逐笔核对。"""
+        records = self.list_merge_audits(batch_id)
+        return {
+            "batch_id": batch_id,
+            "total_audit": len(records),
+            "confirmed_count": sum(1 for r in records if r.get("confirmed")),
+            "pending_count": sum(1 for r in records if not r.get("confirmed")),
+            "by_outcome": self._tally(records, "outcome"),
+            "by_source": self._tally(records, "source"),
+        }
+
+    @staticmethod
+    def _tally(records: list[dict[str, Any]], field: str) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for rec in records:
+            key = str(rec.get(field, ""))
+            result[key] = result.get(key, 0) + 1
+        return result
+
+    def reconcile_merge_batch(self, batch_id: str) -> dict[str, Any]:
+        """核对归并批次的来源行数与审计登记数是否逐笔对齐。"""
+        from app.services.data_manager import read_merge_batch
+        batch = read_merge_batch(batch_id)
+        if not batch:
+            return {"batch_id": batch_id, "found": False, "reconciled": False}
+        line_uids = {line["line_uid"] for line in batch.get("lines", [])}
+        audit_uids = {rec.get("line_uid") for rec in self.list_merge_audits(batch_id)}
+        return {
+            "batch_id": batch_id,
+            "found": True,
+            "status": batch.get("status"),
+            "line_count": len(line_uids),
+            "audit_count": len(audit_uids),
+            "missing_audit": sorted(line_uids - audit_uids),
+            "extra_audit": sorted(audit_uids - line_uids),
+            "reconciled": line_uids == audit_uids,
+        }
+
+    def _hydrate_from_disk(self) -> None:
+        """把磁盘上的归并审计记录同步进内存表，进程重启后工作台仍可查询。
+
+        磁盘 audit_id 是全局编号，可能超出内存表分页窗口；这里用内存表自己的
+        连续 id 建档，同时保留 disk_audit_id 以便回溯持久化记录。
+        """
+        from app.services.data_manager import list_audit
+
+        rows = store.rows(self.MODULE)
+        known_disk_ids = {r.get("disk_audit_id") for r in rows if r.get("disk_audit_id") is not None}
+        next_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+        for rec in list_audit(caller="data_merge"):
+            disk_audit_id = int(rec.get("audit_id", 0))
+            if disk_audit_id in known_disk_ids:
+                continue
+            confirmed = bool(rec.get("confirmed"))
+            rows.append({
+                "id": next_id,
+                "disk_audit_id": disk_audit_id,
+                "记录编号": rec.get("record_no", f"CALL-{disk_audit_id:04d}"),
+                "调用方": rec.get("caller", "data_merge"),
+                "目标API": rec.get("api_name", ""),
+                "请求参数": f"batch={rec.get('batch_id', '')};line={rec.get('line_uid', '')}",
+                "响应码": "200",
+                "响应耗时": "0",
+                "返回行数": str(1 if rec.get("result_index") is not None else 0),
+                "时间戳": rec.get("_logged_at", ""),
+                "status": "已校验" if confirmed else "已记录",
+                "pending": not confirmed,
+                "abnormal": False,
+                "batch_id": rec.get("batch_id"),
+                "line_uid": rec.get("line_uid"),
+                "outcome": rec.get("outcome"),
+                "reason": rec.get("reason"),
+            })
+            next_id += 1
+            known_disk_ids.add(disk_audit_id)
+
+    def list_entries(self, *args: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
+        """查询前先把持久化审计补齐到内存，保证重启后计数与磁盘一致。"""
+        self._hydrate_from_disk()
+        return super().list_entries(*args, **kwargs)
+
     def archive_old_records(self, before_date: str) -> dict[str, Any]:
         """归档指定日期之前的审计记录。"""
         from app.services.data_manager import archive_audit_records
@@ -132,6 +229,9 @@ class CallAuditService(BaseModuleService):
                 "timestamp": row.get("时间戳"),
                 "status": row.get("status"),
             })
+        # 归并逐行审计以磁盘持久记录为准，重启后计数仍与归并明细一致
+        from app.services.data_manager import list_audit
+        merge_audits = list_audit(caller="data_merge")
         return {
             "module": self.MODULE,
             "entity": self.ENTITY,
@@ -140,4 +240,7 @@ class CallAuditService(BaseModuleService):
             "audits": audit_list,
             "archived_count": sum(1 for r in audit_list if r.get("status") == "已归档"),
             "abnormal_count": sum(1 for r in rows if r.get("abnormal")),
+            "merge_audit_count": len(merge_audits),
+            "merge_confirmed_count": sum(1 for r in merge_audits if r.get("confirmed")),
+            "merge_pending_count": sum(1 for r in merge_audits if not r.get("confirmed")),
         }

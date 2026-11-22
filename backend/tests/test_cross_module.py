@@ -350,14 +350,20 @@ class TestCrossModuleFlows:
         assert len(result) >= 3, f"归并后应至少有3条: got {len(result)}"
 
     def test_data_merge_and_audit(self):
-        """归并并写入审计"""
+        """归并并写入审计：返回持久化批次视图，逐行审计与归并明细对齐。"""
         from app.services.data_merge import DataMergeService
 
         svc = DataMergeService()
         source_a = [{"id": 1, "name": "A1"}, {"id": 2, "name": "A2"}]
         source_b = [{"id": 2, "name": "B2"}, {"id": 3, "name": "B3"}]
-        result = svc.merge_and_audit(999, source_a, source_b)
-        assert len(result) >= 3
+        view = svc.merge_and_audit(999, source_a, source_b, batch_id="BATCH-LEGACY")
+        # 规则未生效时不做冲突裁决，4 条来源行全部保留
+        assert len(view["rows"]) == 4
+        # 每条来源行都有一条逐行审计，计数与归并明细一致
+        assert view["line_count"] == 4
+        assert view["audit_count"] == 4
+        assert view["reconciled"] is True
+        assert view["status"] == "已确认"
 
     # ============================================================
     # Flow 11: call_audit

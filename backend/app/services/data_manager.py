@@ -169,9 +169,15 @@ def settle_billing(billing_cycle: str, use_auto_settlement: bool = True) -> dict
 
 
 def write_audit(audit_id: int, audit_data: dict[str, Any]) -> None:
-    """写入审计记录。"""
-    audit_data["_logged_at"] = _now_iso()
+    """写入审计记录。已存在的时间戳在重写（如确认校验）时保留。"""
+    audit_data["_logged_at"] = audit_data.get("_logged_at") or _now_iso()
     _write_json(DATA_ROOT / "audit" / f"{audit_id:06d}.json", audit_data)
+
+
+def next_audit_id() -> int:
+    """按磁盘上已持久化的审计文件分配下一个ID，重启后仍然不冲突。"""
+    _ensure_dir(DATA_ROOT / "audit")
+    return max((int(f.stem) for f in DATA_ROOT.glob("audit/[0-9]*.json")), default=0) + 1
 
 
 def read_audit(audit_id: int) -> dict[str, Any]:
@@ -252,6 +258,41 @@ def list_exports() -> list[dict[str, Any]]:
         record = _read_json(f)
         if record:
             records.append(record)
+    return records
+
+
+# ========== 归并批次与逐行处理记录 ==========
+
+
+def _merge_batch_path(batch_id: str) -> Path:
+    safe = "".join(ch for ch in str(batch_id) if ch.isalnum() or ch in ("-", "_"))
+    return DATA_ROOT / "merge_batches" / f"{safe}.json"
+
+
+def write_merge_batch(batch_id: str, batch: dict[str, Any]) -> None:
+    """持久化一次归并批次的归并明细（来源、行位置、逐行处理结果与原因）。"""
+    batch = dict(batch)
+    batch.setdefault("batch_id", str(batch_id))
+    batch["_updated_at"] = _now_iso()
+    batch.setdefault("_created_at", _now_iso())
+    _write_json(_merge_batch_path(str(batch_id)), batch)
+
+
+def read_merge_batch(batch_id: str) -> dict[str, Any]:
+    """按原批次号读取持久化的归并处理记录，供值班人员重新打开核对。"""
+    return _read_json(_merge_batch_path(str(batch_id)), {})
+
+
+def list_merge_batches() -> list[dict[str, Any]]:
+    """列出全部归并批次，按更新时间倒序，便于辨认已确认/待补处理记录。"""
+    batch_dir = DATA_ROOT / "merge_batches"
+    _ensure_dir(batch_dir)
+    records = []
+    for f in sorted(batch_dir.glob("*.json")):
+        record = _read_json(f)
+        if record:
+            records.append(record)
+    records.sort(key=lambda r: r.get("_updated_at", ""), reverse=True)
     return records
 
 
